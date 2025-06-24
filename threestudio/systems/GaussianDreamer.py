@@ -10,11 +10,21 @@ from gaussiansplatting.arguments import ModelParams, PipelineParams, get_combine
 from gaussiansplatting.scene.cameras import Camera, MiniCam
 from argparse import ArgumentParser, Namespace
 import os
+import math
+import random
 from pathlib import Path
 from plyfile import PlyData, PlyElement
 from gaussiansplatting.utils.sh_utils import SH2RGB
 from gaussiansplatting.scene.gaussian_model import BasicPointCloud
 import numpy as np
+import torchvision
+from torch import nn, Tensor
+import time
+import cv2
+from torchvision.utils import make_grid, save_image
+from segment_anything import sam_model_registry, SamAutomaticMaskGenerator, SamPredictor
+import time
+
 # from shap_e.diffusion.sample import sample_latents
 # from shap_e.diffusion.gaussian_diffusion import diffusion_from_config as diffusion_from_config_shape
 # from shap_e.models.download import load_model, load_config
@@ -74,6 +84,46 @@ def fetchPly(path):
     return BasicPointCloud(points=positions, colors=colors, normals=normals)
 
 
+class SimilarityAttention(nn.Module):
+    def __init__(self):
+        super().__init__()
+        # zero parameters!
+
+    def forward(self, embeds: Tensor, nums: List[int]) -> Tuple[Tensor, Tensor]:
+        """
+        embeds: (M, D) or (B, M, D)
+          – M = number of masked crops (or tokens), D = embedding dim
+          – if you have a batch, pass shape (B, M, D)
+        Returns:
+          attn:  (M, M) or (B, M, M)    — pairwise attention weights
+          out:   (M, D) or (B, M, D)    — attended embeddings
+        """
+        # ensure batch dim
+        batched = True
+        if embeds.dim() == 2:
+            embeds = embeds.unsqueeze(0)  # (1, M, D)
+            batched = False
+
+        B, M, D = embeds.shape
+
+        embeds = F.normalize(embeds, dim=-1)
+        selected_embeds = embeds[:, nums, :]  # (B, 4, D)
+
+        # 1) compute raw scores: (B, M, M)
+        scores = torch.matmul(selected_embeds, embeds.transpose(1,2)) / math.sqrt(D)
+
+        # 2) softmax over the “key” axis
+        attn = F.softmax(scores, dim=-1)  # (B, M, M)
+
+        # 3) attend the embeddings
+        out = torch.matmul(attn, embeds)   # (B, M, D)
+
+        if not batched:
+            attn = attn.squeeze(0)         # (M, M)
+            out  = out .squeeze(0)         # (M, D)
+
+        return attn, out
+
 @threestudio.register("gaussiandreamer-system")
 class GaussianDreamer(BaseLift3DSystem):
     @dataclass
@@ -98,12 +148,15 @@ class GaussianDreamer(BaseLift3DSystem):
         prune_only_end_step: int = 3300
         prune_only_interval: int = 300
         prune_size_threshold: float = 0.008
+        masking: bool = False
+        masking_each_own: bool = False
 
         apose: bool = True
         bg_white: bool = False
 
     cfg: Config
     def configure(self) -> None:
+        print(f"Starting the config")
         self.radius = self.cfg.radius
         self.gaussian = GaussianModel(sh_degree = 0)
         self.background_tensor = torch.tensor([1, 1, 1], dtype=torch.float32, device="cuda") if self.cfg.bg_white else torch.tensor([0, 0, 0], dtype=torch.float32, device="cuda")
@@ -112,7 +165,18 @@ class GaussianDreamer(BaseLift3DSystem):
         self.pipe = PipelineParams(self.parser)
 
         self.texture_structure_joint = self.cfg.texture_structure_joint
+        self.masking = self.cfg.masking
+        self.masking_each_own = self.cfg.masking_each_own
         self.controlnet = self.cfg.controlnet
+        
+        self.sam = sam_model_registry['vit_h'](checkpoint='/n/holylfs05/LABS/pfister_lab/Lab/coxfs01/pfister_lab2/Lab/abenahmedk/sam/sam_vit_h_4b8939.pth')
+        self.sam.to("cuda")
+        self.mask_generator = SamAutomaticMaskGenerator(self.sam)   
+
+        self.scheduled_masks = []
+        self.last_mask_update_step = 0
+        self.mask_update_interval = 10
+        self.count_mask_steps = 0
 
         if self.texture_structure_joint:
             # skel
@@ -128,7 +192,45 @@ class GaussianDreamer(BaseLift3DSystem):
             self.skel.scale(-10)
         
         self.cameras_extent = 4.0
-    
+        
+        start = time.time()
+        self.mobilenet = torchvision.models.mobilenet_v2(pretrained=True).eval()
+        self.feature_extractor = self.mobilenet.features
+        self.sim_att = SimilarityAttention().to(self.device).eval()
+
+
+    def generate_all_sam_masks(self, image_tensor: torch.Tensor):
+        B, H, W, C = image_tensor.shape
+        max_side = 256
+        min_frac, max_frac = 0.005, 0.35
+
+        all_masks = []
+        for i in range(B):
+            img_orig = (image_tensor[i].detach().cpu().numpy() * 255).astype(np.uint8)
+            scale = min(max_side / max(H, W), 1.0)
+            h_lr, w_lr = int(H*scale), int(W*scale)
+            img_lr = cv2.resize(img_orig, (w_lr, h_lr), interpolation=cv2.INTER_LINEAR)
+
+            start = time.time()
+            masks_info = self.mask_generator.generate(img_lr)
+
+            start = time.time()
+            for m in masks_info:
+                seg_lr = m["segmentation"]
+                frac = seg_lr.sum() / (h_lr * w_lr)
+                    
+                seg_up = cv2.resize(
+                    seg_lr.astype(np.uint8),
+                    (W, H), 
+                    interpolation=cv2.INTER_NEAREST
+                ).astype(bool)
+
+                mask_tensor = torch.from_numpy(seg_up.astype(np.float32)).to(image_tensor.device)
+                all_masks.append((mask_tensor, i) if self.masking_each_own else mask_tensor)
+
+        self.scheduled_masks = all_masks
+
+
     def save_gif_to_file(self,images, output_file):  
         with io.BytesIO() as writer:  
             images[0].save(  
@@ -232,7 +334,6 @@ class GaussianDreamer(BaseLift3DSystem):
         return pcd
     
     def forward(self, batch: Dict[str, Any],renderbackground = None) -> Dict[str, Any]:
-
         if renderbackground is None:
             renderbackground = self.background_tensor
             
@@ -314,13 +415,15 @@ class GaussianDreamer(BaseLift3DSystem):
         self.guidance = threestudio.find(self.cfg.guidance_type)(self.cfg.guidance)
     
     def training_step(self, batch, batch_idx):
-
+        
         self.gaussian.update_learning_rate(self.true_global_step)
         
         if self.true_global_step > self.cfg.half_scheduler_max_step:
             self.guidance.set_min_max_steps(min_step_percent=0.02, max_step_percent=0.55)
 
         self.gaussian.update_learning_rate(self.true_global_step)
+
+        mask_active = (self.count_mask_steps % 100) < 50
 
         out = self(batch) 
 
@@ -333,7 +436,6 @@ class GaussianDreamer(BaseLift3DSystem):
         depth_images = depth_images.repeat(1, 1, 1, 3)# to 3-channel
         control_images = out['pose']
 
-        # guidance_eval = (self.true_global_step % 200 == 0)
         guidance_eval = False
         
         if self.texture_structure_joint:
@@ -364,16 +466,132 @@ class GaussianDreamer(BaseLift3DSystem):
         loss_opaque = binary_cross_entropy(opacity_clamped, opacity_clamped)
         self.log("train/loss_opaque", loss_opaque)
         loss += loss_opaque * self.C(self.cfg.loss.lambda_opaque)
-        if guidance_eval:
-            self.guidance_evaluation_save(
-                out["comp_rgb"].detach()[: guidance_out["eval"]["bs"]],
-                guidance_out["eval"],
-            )
+
+        if not self.masking:
+            print("We are not masking")
+            if guidance_eval:
+                self.guidance_evaluation_save(
+                    out["comp_rgb"].detach()[: guidance_out["eval"]["bs"]],
+                    guidance_out["eval"],
+                )
+        
+        elif self.masking_each_own and mask_active:
+            print("We are masking")
+            if hasattr(self, 'scheduled_masks') and self.scheduled_masks:
+                for i in range(len(self.scheduled_masks)):
+                    item = self.scheduled_masks[i]
+                    if isinstance(item, tuple):
+                        self.scheduled_masks[i] = (item[0].detach().cpu(), item[1])
+                    elif torch.is_tensor(item):
+                        self.scheduled_masks[i] = item.detach().cpu()
+                del self.scheduled_masks
+                self.scheduled_masks = []
+                torch.cuda.empty_cache()
+
+            self.generate_all_sam_masks(images)
+            
+
+            fvecs = []
+            start = time.time()
+            for seg, img_idx in self.scheduled_masks:
+                # build the single masked crop
+                m = seg.unsqueeze(-1)                              # [H,W,1]
+                crop = (images[img_idx] * m).unsqueeze(0)           # [1,H,W,3]
+                crop_chw = crop.permute(0,3,1,2)                    # [1,3,H,W]
+                # resize + extract features
+                x224 = F.interpolate(crop_chw, (384,384), mode="bilinear", align_corners=False)
+                with torch.no_grad():
+                    fmap = self.feature_extractor(x224)             # [1,C,h,w]
+                fvec = fmap.mean(dim=[2,3]).squeeze(0)              # [C]
+                fvecs.append(fvec)
+            Ff = torch.stack(fvecs, dim=0).detach()
+
+            total_groups = 1
+            nums = random.sample(range(len(fvecs)), k=total_groups) 
+            print(f"Nums are {nums}")
+            with torch.no_grad():
+                attn_matrix, _ = self.sim_att(Ff, nums)
+
+            # New way of selecting the masks
+            selected_groups = []
+
+            # for i in range(len(attn_matrix)):
+            for row_idx, anchor_idx in enumerate(nums):
+                scores_for_curr_image = attn_matrix[row_idx].clone()
+                # scores_for_curr_image[i] = -1
+                scores_for_curr_image[anchor_idx] = float('-inf')
+
+                #top_k_indices = scores_for_curr_image.argsort()[-3:][::-1]
+                top_k_indices = np.argsort(scores_for_curr_image.cpu().numpy())[-8:][::-1]
+                topk = list(top_k_indices)
+                selected_groups.append([nums[row_idx]] + topk)
+                print(f"{selected_groups = }")
+                print([[attn_matrix[row, idx].item() for idx in group] for row, group in enumerate(selected_groups)])
+
+            for group in selected_groups:
+                crops = []
+                for idx in group:
+                    seg, img_idx = self.scheduled_masks[idx]
+                    mask3 = seg.unsqueeze(-1).repeat(1,1,3)     # [H,W,3]
+                    rgb_crop = (images[img_idx] * mask3)       # [H,W,3]
+                    crops.append(rgb_crop.permute(2,0,1))      # [3,H,W]
+                
+                crops = torch.stack(crops, dim=0)              # [N,3,H,W]
+
+
+                # 3) build your mini-batch of masked RGB/depth/ctrl  
+                rgb_list, d_list, ctrl_list = [], [], []  
+                batch_info = {k: [] for k,v in batch.items() if torch.is_tensor(v) and v.shape[0] == images.shape[0]}  
+                for idx in group:  
+                    seg, img_idx = self.scheduled_masks[idx]  
+                    m = seg.unsqueeze(-1)  
+                    rgb_list.append((images[img_idx]*m).unsqueeze(0))  
+                    d_list.append((depth_images[img_idx]*m).unsqueeze(0))  
+                    ctrl_list.append(control_images[img_idx:img_idx+1])  
+                    for k in batch_info:  
+                        batch_info[k].append(batch[k][img_idx:img_idx+1])  
+
+                mi_cat  = torch.cat(rgb_list, dim=0)  
+                md_cat  = torch.cat(d_list, dim=0)  
+                ctrl_cat= torch.cat(ctrl_list, dim=0)
+
+                for k in batch_info:  
+                    batch_info[k] = torch.cat(batch_info[k], dim=0)  
+
+                if self.texture_structure_joint:
+                    # (control, rgb, depth, prompt)
+                    guidance_out = self.guidance(
+                        ctrl_cat,         # control_images
+                        mi_cat,           # rgb
+                        md_cat,           # depth
+                        prompt_utils,     # prompt
+                        **batch_info,
+                        rgb_as_latents=False,
+                    )
+                elif self.controlnet:
+                    # (control, rgb, prompt)
+                    guidance_out = self.guidance(
+                        ctrl_cat,         # control_images
+                        mi_cat,           # rgb
+                        prompt_utils,     # prompt
+                        **batch_info,
+                        rgb_as_latents=False,
+                    )
+                else:
+                    # (rgb, prompt)
+                    guidance_out = self.guidance(
+                        mi_cat,           # rgb
+                        prompt_utils,     # prompt
+                        **batch_info,
+                        rgb_as_latents=False,
+                    )
+                loss += guidance_out['loss_sds'].mean() * self.C(self.cfg.loss['lambda_sds'])  
+            
+        
+        self.count_mask_steps = (self.count_mask_steps + 1) % 100
         for name, value in self.cfg.loss.items():
             self.log(f"train_params/{name}", self.C(value))
         return {"loss": loss}
-
-
 
     def on_before_optimizer_step(self, optimizer):
 
@@ -566,10 +784,12 @@ class GaussianDreamer(BaseLift3DSystem):
         opt = OptimizationParams(self.parser)
 
         point_cloud = self.pcb()
+        print(f"create from pcd")
+        start = time.time()
         self.gaussian.create_from_pcd(point_cloud, self.cameras_extent)
 
         self.gaussian.training_setup(opt)
-        
+        print(f"finished with optimizers {time.time() - start}")
         ret = {
             "optimizer": self.gaussian.optimizer,
         }
