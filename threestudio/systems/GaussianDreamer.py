@@ -492,7 +492,6 @@ class GaussianDreamer(BaseLift3DSystem):
             
 
             fvecs = []
-            start = time.time()
             for seg, img_idx in self.scheduled_masks:
                 # build the single masked crop
                 m = seg.unsqueeze(-1)                              # [H,W,1]
@@ -514,14 +513,11 @@ class GaussianDreamer(BaseLift3DSystem):
 
             # New way of selecting the masks
             selected_groups = []
-
-            # for i in range(len(attn_matrix)):
             for row_idx, anchor_idx in enumerate(nums):
                 scores_for_curr_image = attn_matrix[row_idx].clone()
-                # scores_for_curr_image[i] = -1
+
                 scores_for_curr_image[anchor_idx] = float('-inf')
 
-                #top_k_indices = scores_for_curr_image.argsort()[-3:][::-1]
                 top_k_indices = np.argsort(scores_for_curr_image.cpu().numpy())[-8:][::-1]
                 topk = list(top_k_indices)
                 selected_groups.append([nums[row_idx]] + topk)
