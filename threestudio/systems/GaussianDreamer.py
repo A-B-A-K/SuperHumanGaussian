@@ -443,9 +443,6 @@ class GaussianDreamer(BaseLift3DSystem):
             name="validation_step",
             step=self.true_global_step,
         )
-        # save_path = self.get_save_path(f"it{self.true_global_step}-val.ply")
-        # self.gaussian.save_ply(save_path)
-        # load_ply(save_path,self.get_save_path(f"it{self.true_global_step}-val-color.ply"))
 
     def on_validation_epoch_end(self):
         pass
