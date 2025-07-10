@@ -17,6 +17,7 @@ from gaussiansplatting.utils.sh_utils import SH2RGB
 from gaussiansplatting.scene.gaussian_model import BasicPointCloud
 import numpy as np
 import torchvision
+import torchvision.transforms.functional as TFunc
 import time
 import cv2
 from torchvision.utils import make_grid, save_image
@@ -112,6 +113,8 @@ class GaussianDreamer(BaseLift3DSystem):
 
         apose: bool = True
         bg_white: bool = False
+        use_img: bool = False
+        img_path: str = ""
 
     cfg: Config
     def configure(self) -> None:
@@ -141,18 +144,67 @@ class GaussianDreamer(BaseLift3DSystem):
         self.last_mask_update_step = 0
         self.mask_update_interval = 10
 
-        if self.texture_structure_joint:
-            # skel
-            self.skel = Skeleton(humansd_style=True, apose=self.cfg.apose)
-            # self.skel.load_json('17point')
-            self.skel.load_smplx(self.cfg.smplx_path, gender=self.cfg.gender)
-            self.skel.scale(-10)
+        self.use_img = self.cfg.use_img
+        self.img_path = self.cfg.img_path
+
+        if self.use_img:
+            model = torch.jit.load('nlf/models/nlf_l_multi.torchscript').cuda().eval()
+            image = torchvision.io.read_image(self.img_path)
+            image = TFunc.rotate(TFunc.hflip(image), angle=270).cuda()
+
+            frame_batch = image.unsqueeze(0)
+            with torch.inference_mode(), torch.device('cuda'):
+                pred = model.detect_smpl_batched(frame_batch, model_name='smplx')
+            
+            import smplx
+            
+            bm_root = os.path.join(os.getenv('DATA_ROOT', default='./nlf'), 'models')
+            bm = smplx.SMPLX(os.path.join(bm_root, 'smplx', 'SMPLX_NEUTRAL.npz'), use_pca=False).cuda().eval()
+
+            pose = pred['pose'][0]
+            betas = pred['betas'][0]
+            transl = pred['trans'][0]
+            res = bm(global_orient=pose[:, :3],
+                    body_pose=pose[:, 3:22*3],
+                    betas=betas,
+                    transl=transl,
+                    left_hand_pose=pose[:, 25*3:40*3],
+                    right_hand_pose=pose[:, 40*3:55*3],
+                    jaw_pose=pose[:, 22*3:23*3],
+                    leye_pose=pose[:, 23*3:24*3],
+                    reye_pose=pose[:, 24*3:25*3],
+                    expression=torch.zeros_like(betas[:, :10])
+                    )
+
+            body_p = pose[:, 3:22*3].detach().cpu().numpy()
+            body_p_shaped = body_p.reshape(21, 3)
+
+            if self.texture_structure_joint:
+                self.skel = Skeleton(humansd_style=True, apose=self.cfg.apose)
+                self.skel.load_smplx(self.cfg.smplx_path, custom=body_p_shaped, gender=self.cfg.gender)
+                self.skel.scale(-10)
+            else:
+                self.skel = Skeleton(apose=self.cfg.apose)
+                self.skel.load_smplx(self.cfg.smplx_path, custom=body_p_shaped, gender=self.cfg.gender)
+                self.skel.scale(-10)
+
         else:
-            # skel
-            self.skel = Skeleton(apose=self.cfg.apose)
-            # self.skel.load_json('8head')
-            self.skel.load_smplx(self.cfg.smplx_path, gender=self.cfg.gender)
-            self.skel.scale(-10)
+            if self.texture_structure_joint:
+                # skel
+                self.skel = Skeleton(humansd_style=True, apose=self.cfg.apose)
+                # self.skel.load_json('17point')
+                self.skel.load_smplx(self.cfg.smplx_path, gender=self.cfg.gender)
+                self.skel.scale(-10)
+            else:
+                # skel
+                self.skel = Skeleton(apose=self.cfg.apose)
+                # self.skel.load_json('8head')
+                self.skel.load_smplx(self.cfg.smplx_path, gender=self.cfg.gender)
+                self.skel.scale(-10)
+
+            
+
+            
         
         self.cameras_extent = 4.0
         
@@ -483,6 +535,7 @@ class GaussianDreamer(BaseLift3DSystem):
             self.cfg.prompt_processor
         )
         self.guidance = threestudio.find(self.cfg.guidance_type)(self.cfg.guidance)
+
     
     def training_step(self, batch, batch_idx):
         

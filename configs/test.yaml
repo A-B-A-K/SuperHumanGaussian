@@ -53,6 +53,8 @@ system:
   prune_size_threshold: 0.008
   apose: true
   bg_white: false
+  use_img: true
+  img_path: "/n/home09/mwagner/SuperHumanGaussian/nlf/testimg.jpg"
 
   prompt_processor_type: "texture-structure-prompt-processor"
   prompt_processor:

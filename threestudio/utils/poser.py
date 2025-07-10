@@ -287,7 +287,7 @@ class Skeleton:
         # coordinate system: opengl --> blender (switch y/z)
         self.points3D[:, [1, 2]] = self.points3D[:, [2, 1]]
     
-    def load_smplx(self, path, betas=None, expression=None, gender='neutral'):
+    def load_smplx(self, path, betas=None, expression=None, custom=None, gender='neutral'):
 
         import smplx, torch
 
@@ -302,16 +302,19 @@ class Skeleton:
             flat_hand_mean=True,
         )
 
-        body_pose = np.zeros((21, 3), dtype=np.float32)
-        if self.apose:
-            body_pose[0, 1] = 0.2
-            body_pose[0, 2] = 0.1
-            body_pose[1, 1] = -0.2
-            body_pose[1, 2] = -0.1
-            body_pose[15, 2] = -0.7853982
-            body_pose[16, 2] = 0.7853982
-            body_pose[19, 0] = 1.0
-            body_pose[20, 0] = 1.0
+        if custom is None:
+            body_pose = np.zeros((21, 3), dtype=np.float32)
+            if self.apose:
+                body_pose[0, 1] = 0.2
+                body_pose[0, 2] = 0.1
+                body_pose[1, 1] = -0.2
+                body_pose[1, 2] = -0.1
+                body_pose[15, 2] = -0.7853982
+                body_pose[16, 2] = 0.7853982
+                body_pose[19, 0] = 1.0
+                body_pose[20, 0] = 1.0
+        else:
+            body_pose = custom
 
         smplx_output = smplx_model(
             body_pose=torch.tensor(body_pose, dtype=torch.float32).unsqueeze(0),
