@@ -272,6 +272,8 @@ class StableDiffusionGuidance(BaseObject):
         azimuth: Float[Tensor, "B"],
         camera_distances: Float[Tensor, "B"],
         res: Int = 512,
+        full_latents: Optional[Float[Tensor, "B 4 64 64"]] = None,
+        full_midas:   Optional[Float[Tensor, "B 4 64 64"]] = None,
         # guidance_rescale: Float = 0.7,
     ):
         batch_size = elevation.shape[0]
@@ -351,6 +353,7 @@ class StableDiffusionGuidance(BaseObject):
         with torch.no_grad():
             # add noise
             noise = torch.randn_like(latents)  # TODO: use torch generator
+            print(f"{latents.shape = }")
             latents_noisy = self.scheduler.add_noise(latents, noise, t)
             # pred noise
             latent_model_input = torch.cat([latents_noisy] * 3, dim=0)
@@ -377,6 +380,32 @@ class StableDiffusionGuidance(BaseObject):
                 unet_added_conditions=unet_added_conditions,
             )
 
+            #import pdb; pdb.set_trace()
+
+            if full_latents is not None: 
+                print("We are in the full latents loop")
+                print(f"{full_latents.shape = }")
+                full_latents_noisy = self.scheduler.add_noise(full_latents, noise, t)
+                full_latent_model_input = torch.cat([full_latents_noisy]*3, dim=0)
+
+                full_midas_depth_noisy = self.scheduler.add_noise(full_midas, midas_depth_noise, t)
+                full_midas_depth_latent_model_in = torch.cat([full_midas_depth_noisy]*3, dim=0)
+
+                full_noisy_latents_with_cond = torch.cat([full_latent_model_input, whole_latents_input], dim=1).to(self.weights_dtype)
+                full_noisy_latents_list = [torch.cat([full_midas_depth_latent_model_in, whole_latents_input], dim=1).to(self.weights_dtype)]
+
+                noise_pred_w = self.forward_unet(
+                    full_noisy_latents_with_cond,
+                    full_noisy_latents_list,
+                    torch.cat([t] * 3),
+                    encoder_hidden_states=text_embeddings,
+                    unet_added_conditions=unet_added_conditions,
+                )
+                txt_w, neg_w, null_w = noise_pred_w.chunk(3)
+            else:
+                txt_w = neg_w = null_w = None
+
+
             # perform guidance (high scale from paper!)
             noise_pred_text, noise_pred_neg, noise_pred_null = noise_pred.chunk(3)
 
@@ -390,6 +419,31 @@ class StableDiffusionGuidance(BaseObject):
             # if self.cfg.guidance_rescale > 0.0:
             #     # Based on 3.4. in https://arxiv.org/pdf/2305.08891.pdf
             #     noise_pred = rescale_noise_cfg(noise_pred, noise_pred_text, guidance_rescale=self.cfg.guidance_rescale)
+        
+            # if txt_w is not None:
+            #     lambda_mask = getattr(self.cfg, "mask_weight", 0.1)
+            #     delta_m = lambda_mask * (noise_pred_text - txt_w)
+
+            delta_add = 0
+
+            if txt_w is not None:  # delta_mneg
+                lambda_mneg = 0.5
+                delta_add = lambda_mneg * (noise_pred_text - neg_w)
+            else: 
+                delta_add = 0
+
+                        
+            # if txt_w is not None: # delta_mun
+            #     lambda_mun = 0.5
+            #     delta_add = lambda_mun * (txt_w - null_w)  
+            # else: 
+            #     delta_add = 0
+
+            # if txt_w is not None: # delta_res
+            #     lambda_res = 0.5
+            #     delta_add = lambda_res * ( (txt_w - null_w) - (noise_pred_text - noise_pred_null) )
+            # else:
+            #     delta_add = 0
 
         if self.cfg.weighting_strategy == "sds":
             # w(t), sigma_t^2
@@ -405,7 +459,12 @@ class StableDiffusionGuidance(BaseObject):
 
         # grad = w * (noise_pred - noise)
         # grad = w * (noise_pred - noise_all)
-        grad = w * (delta_c + delta_d)
+        if full_latents is not None:
+            # grad = w * (delta_c + delta_d + delta_mneg)
+            # grad = w * (delta_c + delta_d + delta_mun)
+            grad = w * (delta_c + delta_d + delta_add)
+        else: 
+            grad =  w * (delta_c + delta_d)
         if self.cfg.grad_clip_pixel:
             grad_norm = torch.norm(grad, dim=-1, keepdim=True) + 1e-8
             grad = grad_norm.clamp(max=self.cfg.grad_clip_threshold) * grad / grad_norm
@@ -737,7 +796,9 @@ class StableDiffusionGuidance(BaseObject):
         rgb: Float[Tensor, "B H W C"],
         depth: Float[Tensor, "B H W C"],
         prompt_utils: PromptProcessorOutput,
-        elevation: Float[Tensor, "B"],
+        full_rgb: Float[Tensor, "B H W C"],
+        full_depth: Optional[Float[Tensor, "B H W C"]],
+        elevation: Optional[Float[Tensor, "B"]],
         azimuth: Float[Tensor, "B"],
         camera_distances: Float[Tensor, "B"],
         rgb_as_latents=False,
@@ -746,12 +807,23 @@ class StableDiffusionGuidance(BaseObject):
         **kwargs,
     ):
         batch_size = rgb.shape[0]
+
+        if full_depth is not None and full_rgb is not None: 
+            img_in, dep_in = rgb, depth
+            img_full, dep_full = full_rgb, full_depth
+        else:
+            img_in = rgb
+            dep_in = depth
         
+
         control_images = control_images.permute(0, 3, 1, 2)
-        rgb_BCHW = rgb.permute(0, 3, 1, 2)
-        midas_depth_BCHW = depth.permute(0, 3, 1, 2)
+        # rgb_BCHW = rgb.permute(0, 3, 1, 2)
+        # midas_depth_BCHW = depth.permute(0, 3, 1, 2)
+        rgb_BCHW = img_in.permute(0, 3, 1, 2)
+        midas_depth_BCHW = dep_in.permute(0, 3, 1, 2)
         latents: Float[Tensor, "B 4 64 64"]
         midas_depth_latents: Float[Tensor, "B 4 64 64"]
+
         if rgb_as_latents:
             latents = F.interpolate(
                 rgb_BCHW, (64, 64), mode="bilinear", align_corners=False
@@ -780,13 +852,30 @@ class StableDiffusionGuidance(BaseObject):
             device=self.device,
         )
 
+        print("Batch size:", batch_size)
+        print("rgb_BCHW_512 shape:", rgb_BCHW_512.shape)
+        print("Encoded latents shape:", latents.shape)
+
+
+        # import pdb; pdb.set_trace()
+
         if self.cfg.use_sjc:
             grad, guidance_eval_utils = self.compute_grad_sjc(
                 control_images, latents, midas_depth_latents, t, prompt_utils, elevation, azimuth, camera_distances, res=rgb_BCHW.shape[-1],
             )
         elif self.cfg.use_anpg:
+            full_latents, full_midas = None, None
+            if full_rgb is not None: 
+                full_rgb_BCHW = img_full.permute(0, 3, 1, 2)
+                full_dep_BCHW = dep_full.permute(0, 3, 1, 2)
+                frgb512 = F.interpolate(full_rgb_BCHW, (512, 512),mode="bilinear", align_corners=False)
+                fdep512 = F.interpolate(full_dep_BCHW, (512, 512), mode="bilinear", align_corners=False)
+                full_latents = self.encode_images(frgb512.to(self.weights_dtype))
+                full_midas = self.encode_images(fdep512.to(self.weights_dtype))
+                full_midas   = (full_midas - depth_mean)/depth_std*rgb_std + rgb_mean
+            
             grad, guidance_eval_utils = self.compute_grad_anpg(
-                control_images, latents, midas_depth_latents, t, prompt_utils, elevation, azimuth, camera_distances, res=rgb_BCHW.shape[-1],
+                control_images, latents, midas_depth_latents, t, prompt_utils, elevation, azimuth, camera_distances, res=rgb_BCHW.shape[-1], full_latents=full_latents, full_midas=full_midas
             )
         else:
             grad, guidance_eval_utils = self.compute_grad_sds(

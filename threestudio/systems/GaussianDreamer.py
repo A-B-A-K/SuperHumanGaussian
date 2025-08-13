@@ -440,7 +440,7 @@ class GaussianDreamer(BaseLift3DSystem):
         
         if self.texture_structure_joint:
             guidance_out = self.guidance(
-                control_images, images, depth_images, prompt_utils, **batch, 
+                control_images, images, depth_images, prompt_utils, full_rgb=None, full_depth=None, **batch, 
                 rgb_as_latents=False, guidance_eval=guidance_eval
             )
         elif self.controlnet:
@@ -518,7 +518,7 @@ class GaussianDreamer(BaseLift3DSystem):
 
                 scores_for_curr_image[anchor_idx] = float('-inf')
 
-                top_k_indices = np.argsort(scores_for_curr_image.cpu().numpy())[-8:][::-1]
+                top_k_indices = np.argsort(scores_for_curr_image.cpu().numpy())[-3:][::-1] #fix later
                 topk = list(top_k_indices)
                 selected_groups.append([nums[row_idx]] + topk)
                 print(f"{selected_groups = }")
@@ -552,7 +552,11 @@ class GaussianDreamer(BaseLift3DSystem):
                 ctrl_cat= torch.cat(ctrl_list, dim=0)
 
                 for k in batch_info:  
-                    batch_info[k] = torch.cat(batch_info[k], dim=0)  
+                    batch_info[k] = torch.cat(batch_info[k], dim=0) 
+                
+                print(f"{ctrl_cat.shape = }, {mi_cat.shape = }, {md_cat.shape = }")
+                print(f"{images.shape = }, {depth_images.shape = }")
+                
 
                 if self.texture_structure_joint:
                     # (control, rgb, depth, prompt)
@@ -561,6 +565,8 @@ class GaussianDreamer(BaseLift3DSystem):
                         mi_cat,           # rgb
                         md_cat,           # depth
                         prompt_utils,     # prompt
+                        images, 
+                        depth_images,
                         **batch_info,
                         rgb_as_latents=False,
                     )
